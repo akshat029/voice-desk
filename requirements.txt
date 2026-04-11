@@ -1,0 +1,10 @@
+faster-whisper
+sounddevice
+numpy
+mss
+pyautogui
+pytesseract
+Pillow
+httpx
+python-dotenv
+pyttsx3

@@ -1,152 +1,237 @@
+"""VoiceDesk entry point: listen, plan, gate, execute."""
+
+from __future__ import annotations
+
 import logging
+import re
+import sys
 import time
 
 import voicedesk.config as cfg
-from voicedesk.brain import plan_actions
-from voicedesk.executor import run_actions, speak_text
-from voicedesk.listener import listen_forever, listen_once
-from voicedesk.vision import get_context
+from voicedesk.actions import Action, PlanError, Risk
+from voicedesk.brain import BrainError, plan_actions, reset_history
+from voicedesk.executor import AppNotAllowed, FailSafe, run_actions, speak_text
+from voicedesk.listener import MicError, listen_forever, listen_once
+from voicedesk.preflight import PreflightError, check_llm, run_preflight
+from voicedesk.vision import enable_dpi_awareness, get_context
 
-# Keys/actions considered dangerous and requiring confirmation
-_DANGEROUS_HOTKEYS = {"delete", "backspace", "f4"}
-_DANGEROUS_ACTIONS = {"drag"}
+log = logging.getLogger(__name__)
 
+AFFIRMATIVE = {
+    "yes",
+    "yeah",
+    "yep",
+    "yup",
+    "sure",
+    "proceed",
+    "confirm",
+    "confirmed",
+    "affirmative",
+    "ok",
+    "okay",
+    "go",
+    "do",
+    "continue",
+}
 
-def _describe_action(action: dict) -> str:
-    """Return a human-readable description of an action."""
-    kind = action.get("action", "")
-    if kind == "hotkey":
-        keys = action.get("keys", [])
-        return f"press {' + '.join(str(k) for k in keys)}"
-    if kind == "press":
-        keys = action.get("keys") or [action.get("text", "")]
-        return f"press {', '.join(str(k) for k in keys)}"
-    if kind == "type":
-        text = str(action.get("text", ""))[:40]
-        return f"type '{text}'"
-    if kind == "drag":
-        return f"drag to ({action.get('x')}, {action.get('y')})"
-    if kind == "open_app":
-        return f"open {action.get('name', 'app')}"
-    return kind
+NEGATIVE = {
+    "no",
+    "nope",
+    "nah",
+    "stop",
+    "cancel",
+    "dont",
+    "don",
+    "abort",
+    "wait",
+    "never",
+    "negative",
+}
 
+_WORDS = re.compile(r"[a-z]+")
 
-def _is_dangerous(action: dict) -> bool:
-    """Check if an action is potentially destructive."""
-    kind = action.get("action", "")
-    if kind in _DANGEROUS_ACTIONS:
-        return True
-    if kind == "hotkey":
-        keys = {str(k).lower() for k in action.get("keys", [])}
-        if keys & _DANGEROUS_HOTKEYS:
-            return True
-        if "alt" in keys and "f4" in keys:
-            return True
-        if "ctrl" in keys and ("w" in keys or "q" in keys):
-            return True
-    if kind == "press":
-        keys_list = action.get("keys") or [action.get("text", "")]
-        if any(str(k).lower() in _DANGEROUS_HOTKEYS for k in keys_list):
-            return True
-    return False
+_SHELL_WINDOW = re.compile(
+    r"(command prompt|powershell|windows terminal|cmd\.exe|terminal|iterm|bash|zsh)",
+    re.IGNORECASE,
+)
 
-
-def _confirm_action(action: dict) -> bool:
-    """Ask user for voice confirmation before a dangerous action."""
-    desc = _describe_action(action)
-    speak_text(f"I'm about to {desc}. Should I proceed?")
-    logging.info(f"Safety: awaiting confirmation for '{desc}'")
-    response = listen_once(timeout_seconds=5.0)
-    logging.info(f"Safety: user said '{response}'")
-    affirmative = {"yes", "yeah", "yep", "sure", "go ahead", "do it", "proceed", "okay", "ok"}
-    return any(word in response.lower() for word in affirmative)
+_BACKEND_PHRASES = {
+    "gemini": ("switch to gemini", "use gemini"),
+    "groq": ("switch to groq", "use groq"),
+    "ollama": ("switch to ollama", "use ollama", "go local", "go private"),
+}
 
 
-def _check_backend_switch(command_text: str) -> bool:
-    """Handle voice commands to switch LLM backends. Returns True if handled."""
+def parse_confirmation(response: str) -> bool:
+    """Word-boundary confirmation parsing, with negation taking priority.
+
+    The old check was a substring scan over a phrase set that included
+    "do it", so "no, don't do it" *contained* "do it" and was read as
+    consent. "ok" also matched inside unrelated words like "spoke", "look",
+    and "broke".
+    """
+    words = set(_WORDS.findall(response.lower()))
+    if not words:
+        return False
+    if words & NEGATIVE:
+        return False
+    return bool(words & AFFIRMATIVE)
+
+
+def effective_risk(action: Action, active_window: str = "") -> Risk:
+    """Escalate risk based on where the action will land.
+
+    Typing is normally harmless, but typing into a shell is how a typo
+    becomes a destroyed working directory. The old ``_DANGEROUS_ACTIONS``
+    set contained only "drag", leaving both `type` and `open_app`
+    completely unguarded.
+    """
+    if action.action == "type" and _SHELL_WINDOW.search(active_window or ""):
+        return Risk.DESTRUCTIVE
+    if action.action == "open_app":
+        name = action.name.strip().lower()  # type: ignore[attr-defined]
+        if name in cfg.SHELL_APPS:
+            return Risk.DESTRUCTIVE
+    return action.risk
+
+
+def _confirm(action: Action) -> bool:
+    speak_text(f"I'm about to {action.describe()}. Should I go ahead?")
+    reply = listen_once(timeout_seconds=cfg.CONFIRM_TIMEOUT)
+    if cfg.LOG_TRANSCRIPTS:
+        log.info("Confirmation reply: %r", reply)
+    approved = parse_confirmation(reply)
+    log.info(
+        "Confirmation for %r: %s",
+        action.describe(),
+        "approved" if approved else "declined",
+    )
+    return approved
+
+
+def _maybe_switch_backend(command_text: str) -> bool:
+    """Handle voice backend switching, validating the target first."""
     lowered = command_text.lower()
-    if "switch to gemini" in lowered or "use gemini" in lowered:
-        cfg.LLM_BACKEND = "gemini"
-        speak_text("Switched to Google Gemini.")
-        logging.info("Backend switched to GEMINI")
-        return True
-    if "switch to groq" in lowered or "use groq" in lowered:
-        cfg.LLM_BACKEND = "groq"
-        speak_text("Switched to Groq.")
-        logging.info("Backend switched to GROQ")
-        return True
-    if "switch to ollama" in lowered or "use ollama" in lowered:
-        cfg.LLM_BACKEND = "ollama"
-        speak_text("Switched to Ollama.")
-        logging.info("Backend switched to OLLAMA")
+    for backend, phrases in _BACKEND_PHRASES.items():
+        if not any(phrase in lowered for phrase in phrases):
+            continue
+
+        previous = cfg.LLM_BACKEND
+        cfg.LLM_BACKEND = backend
+        blockers = [problem for problem in check_llm() if problem.fatal]
+        if blockers:
+            cfg.LLM_BACKEND = previous
+            log.warning("Backend switch to %s refused: %s", backend, blockers[0].what)
+            speak_text(f"I can't switch to {backend}. {blockers[0].fix}")
+            return True
+
+        # Message shapes differ per backend, notably Gemini's strict role
+        # alternation, so carrying history across a switch is unsafe.
+        reset_history()
+        log.info("Backend switched to %s -> %s", backend.upper(), cfg.active_model())
+        speak_text(f"Switched to {backend}.")
         return True
     return False
 
 
-def _handle_command(command_text: str) -> None:
-    logging.info(f"Heard: \"{command_text}\"")
+def handle_command(command_text: str) -> None:
+    if cfg.LOG_TRANSCRIPTS:
+        log.info("Heard: %r", command_text)
+    else:
+        log.info("Heard a command (%d chars)", len(command_text))
 
-    # Check for backend switch voice commands
-    if _check_backend_switch(command_text):
+    if _maybe_switch_backend(command_text):
         return
 
-    t0 = time.perf_counter()
+    started = time.perf_counter()
     try:
         context = get_context(command_text)
         actions = plan_actions(command_text, context)
         if not actions:
-            raise ValueError("No actions returned by LLM")
-        elapsed = time.perf_counter() - t0
-        logging.info(f"Planned {len(actions)} action(s) in {elapsed:.1f}s")
+            raise PlanError("the model returned an empty plan")
 
-        # Safety confirmation for dangerous actions
-        if cfg.CONFIRM_DANGEROUS:
-            safe_actions = []
-            for action in actions:
-                if _is_dangerous(action):
-                    if _confirm_action(action):
-                        safe_actions.append(action)
-                    else:
-                        speak_text("Cancelled.")
-                        logging.info(f"Safety: user cancelled '{_describe_action(action)}'")
-                else:
-                    safe_actions.append(action)
-            actions = safe_actions
+        log.info(
+            "Planned %d action(s) in %.1fs",
+            len(actions),
+            time.perf_counter() - started,
+        )
 
-        if actions:
-            run_actions(actions)
+        active_window = str(context.get("active_window", ""))
+        for action in actions:
+            risk = effective_risk(action, active_window)
+            if cfg.CONFIRM_DANGEROUS and risk is Risk.DESTRUCTIVE:
+                if not _confirm(action):
+                    # Abandon the whole plan. Skipping one step and
+                    # continuing leaves the desktop half-changed.
+                    speak_text("Cancelled.")
+                    return
 
-    except Exception as exc:
-        message = f"Error: {exc}"
-        logging.error(message)
-        if cfg.TTS_ENABLED:
-            speak_text(f"Sorry, something went wrong. {exc}")
+        run_actions(actions, frame=context.get("frame"))
+
+    except FailSafe:
+        raise
+    except AppNotAllowed as exc:
+        log.warning("Blocked app launch: %s", exc)
+        speak_text("That app isn't on my allowed list, so I didn't open it.")
+    except PlanError as exc:
+        log.error("Invalid plan: %s", exc)
+        speak_text("I couldn't turn that into a safe plan. Could you rephrase?")
+    except BrainError as exc:
+        log.error("Model error: %s", exc)
+        speak_text("I couldn't reach the model. Check the connection and try again.")
+    except Exception:
+        log.exception("Unhandled error while handling a command")
+        speak_text("Sorry, something went wrong.")
+
+
+def _configure_logging() -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if cfg.LOG_FILE:
+        handlers.append(logging.FileHandler(cfg.LOG_FILE, encoding="utf-8"))
+    logging.basicConfig(
+        level=getattr(logging, cfg.LOG_LEVEL, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
 
 
 def run() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler("voicedesk.log", encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    model_name = cfg.OLLAMA_MODEL if cfg.LLM_BACKEND == "ollama" else (
-        cfg.GEMINI_MODEL if cfg.LLM_BACKEND == "gemini" else cfg.GROQ_MODEL
-    )
-    privacy = "LOCAL (private)" if cfg.LLM_BACKEND == "ollama" else "CLOUD"
+    enable_dpi_awareness()
+    _configure_logging()
 
-    logging.info("=" * 50)
-    logging.info("      VoiceDesk v2.0 - Desktop Assistant")
-    logging.info("=" * 50)
-    logging.info(f"  Backend  : {cfg.LLM_BACKEND.upper()} -> {model_name}")
-    logging.info(f"  Privacy  : {privacy}")
-    logging.info(f"  Safety   : {'ON' if cfg.CONFIRM_DANGEROUS else 'OFF'}")
-    logging.info("=" * 50)
-    logging.info("  Listening... speak a command anytime.")
-    logging.info("  Say 'switch to gemini/groq/ollama' to change backend.")
+    try:
+        run_preflight(strict=True)
+    except PreflightError as exc:
+        print(exc, file=sys.stderr)
+        print("Fix the items above and run again.", file=sys.stderr)
+        raise SystemExit(1)
 
-    if cfg.TTS_ENABLED:
-        speak_text("VoiceDesk online. Awaiting your command.")
-    listen_forever(_handle_command)
+    log.info("%s", "=" * 60)
+    log.info("  VoiceDesk")
+    log.info("  Brain   : %s -> %s", cfg.LLM_BACKEND.upper(), cfg.active_model())
+    log.info("  Speech  : %s", cfg.STT_BACKEND.upper())
+    log.info("  Privacy : %s", "local only" if cfg.is_local_only() else "cloud")
+    log.info(
+        "  Safety  : confirmations %s, dry-run %s",
+        "on" if cfg.CONFIRM_DANGEROUS else "OFF",
+        "on" if cfg.DRY_RUN else "off",
+    )
+    log.info("%s", "=" * 60)
+    log.info("  Listening. Say 'switch to gemini/groq/ollama' to change brain.")
+    log.info("  Panic: slam the mouse into a screen corner to abort.")
+
+    speak_text("VoiceDesk online.")
+
+    try:
+        listen_forever(handle_command)
+    except KeyboardInterrupt:
+        log.info("Interrupted. Shutting down.")
+    except FailSafe:
+        log.warning("Failsafe triggered. VoiceDesk stopped.")
+    except MicError as exc:
+        log.error("Microphone unavailable: %s", exc)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    run()

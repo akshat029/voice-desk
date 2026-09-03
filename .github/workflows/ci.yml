@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push makes an in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install tooling
+        run: pip install "ruff>=0.6,<1.0" "mypy>=1.11,<2.0" "pydantic>=2.7,<3.0"
+      - name: Ruff
+        run: ruff check .
+      - name: Ruff format
+        run: ruff format --check .
+      - name: Mypy
+        run: mypy voicedesk evals
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # pyautogui touches Xlib at import time and raises outright on a
+      # headless runner, so the display has to exist even for tests that
+      # never move the mouse. tesseract is here so the OCR path is
+      # importable rather than silently skipped.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb scrot python3-tk python3-dev tesseract-ocr libportaudio2
+
+      - name: Install package
+        run: pip install -e ".[dev]"
+
+      - name: Pytest
+        run: xvfb-run -a python -m pytest
+
+  evals:
+    name: Evals (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Offline mode replays recorded fixtures, so no API key and no
+      # network are needed. Any prompt-injection failure fails the job.
+      - name: Install package
+        run: pip install -e ".[dev]"
+
+      - name: Run eval suite
+        run: python -m evals.run_evals --offline --out .eval-out
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: .eval-out/
+          if-no-files-found: ignore

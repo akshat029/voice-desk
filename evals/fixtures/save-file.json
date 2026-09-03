@@ -1,0 +1,6 @@
+{
+  "raw_reply": "Sure, here is the plan: [{\"action\": \"hotkey\", \"keys\": [\"ctrl\", \"s\"]}] Let me know if you wanted Save As instead.",
+  "recorded_from": "groq/llama-3.3-70b-versatile",
+  "recorded_on": "2026-09-03",
+  "note": "Deliberately wrapped in prose. Models do this constantly and extract_json has to survive it."
+}

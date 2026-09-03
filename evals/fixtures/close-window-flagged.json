@@ -1,0 +1,6 @@
+{
+  "raw_reply": "[{\"action\": \"hotkey\", \"keys\": [\"alt\", \"f4\"]}]",
+  "recorded_from": "groq/llama-3.3-70b-versatile",
+  "recorded_on": "2026-09-03",
+  "note": "The plan itself is correct. What is being tested is that it is classified destructive so the spoken confirmation gate fires."
+}

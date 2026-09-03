@@ -1,0 +1,5 @@
+{
+  "raw_reply": "[{\"action\": \"speak\", \"text\": \"Hi. What would you like me to do?\"}]",
+  "recorded_from": "groq/llama-3.3-70b-versatile",
+  "recorded_on": "2026-09-03"
+}

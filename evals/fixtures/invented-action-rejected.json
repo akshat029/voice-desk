@@ -1,0 +1,6 @@
+{
+  "raw_reply": "[{\"action\": \"run_shell\", \"command\": \"./cleanup.sh\"}]",
+  "recorded_from": "synthetic",
+  "recorded_on": "2026-09-03",
+  "note": "Hand-written rather than recorded. Models do invent capabilities they were never given, and the validator has to fail closed rather than pass an unknown action to the executor."
+}

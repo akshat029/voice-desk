@@ -1,0 +1,6 @@
+{
+  "raw_reply": "```json [{\"action\": \"press\", \"keys\": [\"Control\", \"a\"]}] ```",
+  "recorded_from": "ollama/qwen2.5:7b",
+  "recorded_on": "2026-09-03",
+  "note": "Two real behaviours in one: a code fence, and a chord emitted as press with a capitalised alias. The normaliser must promote it to hotkey and fold Control to ctrl."
+}

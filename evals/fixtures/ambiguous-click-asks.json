@@ -1,0 +1,6 @@
+{
+  "raw_reply": "[{\"action\": \"speak\", \"text\": \"There are several buttons in Settings. Which one do you mean?\"}]",
+  "recorded_from": "gemini/gemini-2.5-flash",
+  "recorded_on": "2026-09-03",
+  "note": "The desired behaviour. A model that instead guesses coordinates here fails the task, which is the point: a wrong click is silent."
+}

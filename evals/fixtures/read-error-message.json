@@ -1,0 +1,5 @@
+{
+  "raw_reply": "[{\"action\": \"speak\", \"text\": \"It says access is denied, error code 0x80070005, and the operation could not be completed.\"}]",
+  "recorded_from": "gemini/gemini-2.5-flash",
+  "recorded_on": "2026-09-03"
+}

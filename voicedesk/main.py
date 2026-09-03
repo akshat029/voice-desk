@@ -3,57 +3,19 @@
 from __future__ import annotations
 
 import logging
-import re
 import sys
 import time
 
 import voicedesk.config as cfg
-from voicedesk.actions import Action, PlanError, Risk
+from voicedesk.actions import PlanError
 from voicedesk.brain import BrainError, plan_actions, reset_history
 from voicedesk.executor import AppNotAllowed, FailSafe, run_actions, speak_text
 from voicedesk.listener import MicError, listen_forever, listen_once
 from voicedesk.preflight import PreflightError, check_llm, run_preflight
+from voicedesk.safety import effective_risk, needs_confirmation, parse_confirmation
 from voicedesk.vision import enable_dpi_awareness, get_context
 
 log = logging.getLogger(__name__)
-
-AFFIRMATIVE = {
-    "yes",
-    "yeah",
-    "yep",
-    "yup",
-    "sure",
-    "proceed",
-    "confirm",
-    "confirmed",
-    "affirmative",
-    "ok",
-    "okay",
-    "go",
-    "do",
-    "continue",
-}
-
-NEGATIVE = {
-    "no",
-    "nope",
-    "nah",
-    "stop",
-    "cancel",
-    "dont",
-    "don",
-    "abort",
-    "wait",
-    "never",
-    "negative",
-}
-
-_WORDS = re.compile(r"[a-z]+")
-
-_SHELL_WINDOW = re.compile(
-    r"(command prompt|powershell|windows terminal|cmd\.exe|terminal|iterm|bash|zsh)",
-    re.IGNORECASE,
-)
 
 _BACKEND_PHRASES = {
     "gemini": ("switch to gemini", "use gemini"),
@@ -62,40 +24,7 @@ _BACKEND_PHRASES = {
 }
 
 
-def parse_confirmation(response: str) -> bool:
-    """Word-boundary confirmation parsing, with negation taking priority.
-
-    The old check was a substring scan over a phrase set that included
-    "do it", so "no, don't do it" *contained* "do it" and was read as
-    consent. "ok" also matched inside unrelated words like "spoke", "look",
-    and "broke".
-    """
-    words = set(_WORDS.findall(response.lower()))
-    if not words:
-        return False
-    if words & NEGATIVE:
-        return False
-    return bool(words & AFFIRMATIVE)
-
-
-def effective_risk(action: Action, active_window: str = "") -> Risk:
-    """Escalate risk based on where the action will land.
-
-    Typing is normally harmless, but typing into a shell is how a typo
-    becomes a destroyed working directory. The old ``_DANGEROUS_ACTIONS``
-    set contained only "drag", leaving both `type` and `open_app`
-    completely unguarded.
-    """
-    if action.action == "type" and _SHELL_WINDOW.search(active_window or ""):
-        return Risk.DESTRUCTIVE
-    if action.action == "open_app":
-        name = action.name.strip().lower()  # type: ignore[attr-defined]
-        if name in cfg.SHELL_APPS:
-            return Risk.DESTRUCTIVE
-    return action.risk
-
-
-def _confirm(action: Action) -> bool:
+def _confirm(action) -> bool:
     speak_text(f"I'm about to {action.describe()}. Should I go ahead?")
     reply = listen_once(timeout_seconds=cfg.CONFIRM_TIMEOUT)
     if cfg.LOG_TRANSCRIPTS:
@@ -110,7 +39,12 @@ def _confirm(action: Action) -> bool:
 
 
 def _maybe_switch_backend(command_text: str) -> bool:
-    """Handle voice backend switching, validating the target first."""
+    """Handle voice backend switching, validating the target first.
+
+    Switching used to just reassign the config value, so "switch to gemini"
+    without a key looked like it worked and then failed on the next
+    command.
+    """
     lowered = command_text.lower()
     for backend, phrases in _BACKEND_PHRASES.items():
         if not any(phrase in lowered for phrase in phrases):
@@ -156,12 +90,13 @@ def handle_command(command_text: str) -> None:
             time.perf_counter() - started,
         )
 
+        # Gate the whole plan before executing any of it. The old executor
+        # confirmed step by step while already mid-execution.
         active_window = str(context.get("active_window", ""))
         for action in actions:
-            risk = effective_risk(action, active_window)
-            if cfg.CONFIRM_DANGEROUS and risk is Risk.DESTRUCTIVE:
+            if needs_confirmation(effective_risk(action, active_window)):
                 if not _confirm(action):
-                    # Abandon the whole plan. Skipping one step and
+                    # Abandon the entire plan. Skipping one step and
                     # continuing leaves the desktop half-changed.
                     speak_text("Cancelled.")
                     return
